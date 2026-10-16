@@ -97,14 +97,43 @@ static rc522_status_t calc_crc(const uint8_t *data, size_t len, uint8_t out[2])
     return RC522_TIMEOUT;
 }
 
+// Reprogram the chip's response timer so TimerIRq fires after ~`ms`
+// milliseconds of silence from the card. The timer counts down at
+// f = 13.56 MHz / (2*prescaler + 1); the reload value is chosen so it fits in
+// the 16-bit reload register, growing the 12-bit prescaler for long timeouts
+// (needed for ISO-DEP frame-waiting times up to ~5 s and WTX extensions).
+static void set_timer_ms(uint32_t ms)
+{
+    if (ms == 0) ms = 1;
+    uint32_t prescaler = 0xA9;              // default from init: ~40 kHz, 25 us/tick
+    uint64_t reload;
+    for (;;) {
+        uint32_t ftimer = 13560000UL / (2 * prescaler + 1);
+        reload = ((uint64_t)ms * ftimer) / 1000;
+        if (reload <= 0xFFFF || prescaler >= 0xFFF) break;
+        prescaler = (prescaler << 1) | 1;  // roughly double, stay odd
+        if (prescaler > 0xFFF) prescaler = 0xFFF;
+    }
+    if (reload > 0xFFFF) reload = 0xFFFF;
+    if (reload == 0) reload = 1;
+    // TPrescaler is 12-bit: low 8 bits in T_PRESCALER, high 4 in T_MODE's low
+    // nibble; keep TAuto (0x80) so the timer starts at end of transmission.
+    write_reg(REG_T_MODE, 0x80 | ((prescaler >> 8) & 0x0F));
+    write_reg(REG_T_PRESCALER, prescaler & 0xFF);
+    write_reg(REG_T_RELOAD_H, (reload >> 8) & 0xFF);
+    write_reg(REG_T_RELOAD_L, reload & 0xFF);
+}
+
 static rc522_status_t communicate(uint8_t cmd, uint8_t wait_irq,
                                   const uint8_t *send, size_t send_len,
                                   uint8_t *back, uint8_t *back_len,
-                                  uint8_t *valid_bits, uint8_t rx_align, bool check_crc)
+                                  uint8_t *valid_bits, uint8_t rx_align, bool check_crc,
+                                  uint32_t timeout_ms)
 {
     uint8_t tx_last_bits = valid_bits ? *valid_bits : 0;
     uint8_t bit_framing = (rx_align << 4) | tx_last_bits;
 
+    set_timer_ms(timeout_ms);
     write_reg(REG_COMMAND, CMD_IDLE);
     write_reg(REG_COM_IRQ, 0x7F);       // clear all IRQ flags
     write_reg(REG_FIFO_LEVEL, 0x80);    // flush FIFO
@@ -115,8 +144,9 @@ static rc522_status_t communicate(uint8_t cmd, uint8_t wait_irq,
         set_bits(REG_BIT_FRAMING, 0x80);    // StartSend
     }
 
-    // The internal timer (25 ms) sets TimerIRq if the card does not answer.
-    int64_t deadline = esp_timer_get_time() + 36000;
+    // The chip timer sets TimerIRq if the card stays silent; the host deadline
+    // is a slightly longer backstop so a stuck transfer cannot hang forever.
+    int64_t deadline = esp_timer_get_time() + (int64_t)timeout_ms * 1000 + 15000;
     bool done = false;
     while (esp_timer_get_time() < deadline) {
         uint8_t irq = read_reg(REG_COM_IRQ);
@@ -160,7 +190,43 @@ static rc522_status_t transceive(const uint8_t *send, size_t send_len, uint8_t *
                                  uint8_t *back_len, uint8_t *valid_bits, bool check_crc)
 {
     return communicate(CMD_TRANSCEIVE, 0x30, send, send_len, back, back_len,
-                       valid_bits, 0, check_crc);
+                       valid_bits, 0, check_crc, 40);
+}
+
+rc522_status_t rc522_transceive_raw(const uint8_t *send, size_t send_len,
+                                    uint8_t *back, size_t *back_len,
+                                    bool append_crc, bool check_crc,
+                                    uint32_t timeout_ms)
+{
+    // Build the frame in a 64-byte scratch buffer (the FIFO's full depth).
+    uint8_t buf[64];
+    size_t n = send_len;
+    if (append_crc) {
+        if (send_len + 2 > sizeof(buf)) return RC522_NO_ROOM;
+        memcpy(buf, send, send_len);
+        rc522_status_t s = calc_crc(send, send_len, &buf[send_len]);
+        if (s != RC522_OK) return s;
+        n = send_len + 2;
+    } else {
+        if (send_len > sizeof(buf)) return RC522_NO_ROOM;
+        memcpy(buf, send, send_len);
+    }
+
+    uint8_t cap = (*back_len > 255) ? 255 : (uint8_t)*back_len;
+    uint8_t blen = cap;
+    uint8_t valid_bits = 0;
+    rc522_status_t s = communicate(CMD_TRANSCEIVE, 0x30, buf, n, back, &blen,
+                                   &valid_bits, 0, check_crc, timeout_ms);
+    if (s != RC522_OK) { *back_len = 0; return s; }
+
+    size_t out = blen;
+    if (check_crc) {
+        // communicate already verified the CRC_A; drop the two trailing bytes.
+        if (out < 2) { *back_len = 0; return RC522_CRC_WRONG; }
+        out -= 2;
+    }
+    *back_len = out;
+    return RC522_OK;
 }
 
 esp_err_t rc522_init(const rc522_config_t *cfg)
@@ -302,7 +368,7 @@ rc522_status_t rc522_mifare_auth(uint8_t key_type, uint8_t block, const uint8_t 
     memcpy(&buf[8], &card->uid[card->uid_len - 4], 4);
 
     rc522_status_t s = communicate(CMD_MF_AUTHENT, 0x10, buf, sizeof(buf),
-                                   NULL, NULL, NULL, 0, false);
+                                   NULL, NULL, NULL, 0, false, 40);
     if (s != RC522_OK) return s;
     return (read_reg(REG_STATUS2) & 0x08) ? RC522_OK : RC522_ERR;   // MFCrypto1On
 }

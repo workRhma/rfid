@@ -59,5 +59,21 @@ rc522_status_t rc522_mifare_read(uint8_t addr, uint8_t out[16]);
 // must be authenticated first with a key that grants write access.
 rc522_status_t rc522_mifare_write(uint8_t addr, const uint8_t data[16]);
 
+// Low-level ISO 14443-3/4 transceive, exposed for the ISO-DEP layer.
+// Sends `send_len` bytes through the FIFO with the Transceive command. If
+// `append_crc` is set, a CRC_A computed by the chip's coprocessor is appended.
+// The response is written into `back` (its capacity passed in *back_len on
+// entry, the actual length returned there); if `check_crc` is set the trailing
+// CRC_A is verified and stripped. `timeout_ms` reprograms the chip's response
+// timer (used for the ISO-DEP frame-waiting time / WTX extensions).
+//
+// The MFRC522 FIFO is only 64 bytes, so `send_len` (+2 when append_crc) must be
+// <= 64 and the response cannot exceed 64 bytes. Larger payloads require
+// ISO 14443-4 chaining, handled one frame at a time by the caller.
+rc522_status_t rc522_transceive_raw(const uint8_t *send, size_t send_len,
+                                    uint8_t *back, size_t *back_len,
+                                    bool append_crc, bool check_crc,
+                                    uint32_t timeout_ms);
+
 const char *rc522_card_type(uint8_t sak);
 const char *rc522_status_str(rc522_status_t s);

@@ -5,6 +5,7 @@
 #include "freertos/task.h"
 #include "esp_log.h"
 #include "rc522.h"
+#include "emv.h"
 
 static const char *TAG = "rfid";
 
@@ -12,6 +13,11 @@ static const char *TAG = "rfid";
 //   0 = read cards and dump their contents to the log (default)
 //   1 = write the stored image below onto the presented (blank) card
 #define MODE_CLONE   0
+
+// When set, cards that advertise ISO 14443-4 (SAK bit 0x20, e.g. SAK 0x20/0x28/
+// 0x38) are explored over ISO-DEP as EMV contactless cards instead of being
+// dumped as MIFARE Classic. Read-only; see emv.c.
+#define MODE_EMV     1
 
 // ---- RC522 wiring (SPI) ----
 #define RC522_SCK     GPIO_NUM_4
@@ -211,6 +217,15 @@ static void handle_card(const uint8_t atqa[2])
     rc522_halt();
     ESP_LOGI(TAG, "=======================");
     return;
+#endif
+
+#if MODE_EMV
+    if (card.sak & 0x20) {          // ISO 14443-4 capable -> try EMV over ISO-DEP
+        emv_dump();
+        rc522_halt();
+        ESP_LOGI(TAG, "=======================");
+        return;
+    }
 #endif
 
     switch (card.sak & 0x7F) {
